@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app
 
-CMD ["bash", "ops/offset_safe_entrypoint.sh"]
+CMD ["python", "-u", "main.py"]

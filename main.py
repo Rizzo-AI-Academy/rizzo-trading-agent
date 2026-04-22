@@ -1,81 +1,51 @@
-from indicators import analyze_multiple_tickers
-from news_feed import fetch_latest_news
-from trading_agent import previsione_trading_agent
-from utils import check_stop_loss
-from whalealert import format_whale_alerts_to_string
-from sentiment import get_sentiment
-from forecaster import get_crypto_forecasts
-from hyperliquid_trader import HyperLiquidTrader
-import os
+"""Entrypoint — runs one full trading cycle through the Orchestrator.
+
+Usage:
+    python main.py                 # one cycle
+    RUN_INTERVAL_SECONDS=0 ...     # explicit single-shot
+"""
+from __future__ import annotations
+
 import json
-import db_utils
-from dotenv import load_dotenv
-load_dotenv()
+import sys
 
-# Collegamento ad Hyperliquid
-TESTNET = True   # True = testnet, False = mainnet (occhio!)
-VERBOSE = True    # stampa informazioni extra
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+from core.config import Settings
+from core.logging import get_logger, setup_logging
+from decision.kernel import LLMClient
+from execution.hyperliquid_adapter import HyperliquidAdapter
+from indicators import analyze_multiple_tickers
+from market.context import build_external_context
+from orchestrator.runtime import Orchestrator
 
-if not PRIVATE_KEY or not WALLET_ADDRESS:
-    raise RuntimeError("PRIVATE_KEY o WALLET_ADDRESS mancanti nel .env")
-try:
-    bot = HyperLiquidTrader(
-        secret_key=PRIVATE_KEY,
-        account_address=WALLET_ADDRESS,
-        testnet=TESTNET
+
+def main() -> int:
+    setup_logging()
+    log = get_logger("main")
+    settings = Settings.load()
+    settings.validate_for_live() if not settings.dry_run else None
+
+    # market data (legacy fetcher; returns (text, list[dict])
+    _, indicator_rows = analyze_multiple_tickers(settings.tickers, testnet=settings.testnet)
+
+    # external context
+    ext = build_external_context(settings.tickers)
+
+    # adapter + llm
+    adapter = HyperliquidAdapter(
+        secret_key=settings.private_key,
+        account_address=settings.wallet_address,
+        testnet=settings.testnet,
     )
+    llm = LLMClient(api_key=settings.openai_api_key, model=settings.decision.llm_model)
 
-    # Calcolo delle informazioni in input per Ticker
-    tickers = ['BTC', 'ETH', 'SOL']
-    indicators_txt, indicators_json  = analyze_multiple_tickers(tickers)
-    news_txt = fetch_latest_news()
-    # whale_alerts_txt = format_whale_alerts_to_string()
-    sentiment_txt, sentiment_json  = get_sentiment()
-    forecasts_txt, forecasts_json = get_crypto_forecasts()
+    orch = Orchestrator(settings, adapter=adapter, llm=llm)
+    orch.bootstrap()
 
-
-    msg_info=f"""<indicatori>\n{indicators_txt}\n</indicatori>\n\n
-    <news>\n{news_txt}</news>\n\n
-    <sentiment>\n{sentiment_txt}\n</sentiment>\n\n
-    <forecast>\n{forecasts_txt}\n</forecast>\n\n"""
-
-    account_status = bot.get_account_status()
-
-    stop_losses = check_stop_loss(account_status)
-
-    portfolio_data = f"{json.dumps(account_status)}\n Stop Loss attivati 15 min fa: {stop_losses}"
-
-    # Scrivo su file come sta
-    snapshot_id = db_utils.log_account_status(account_status)
-    print(f"[db_utils] Operazione inserita con id={snapshot_id}")
+    result = orch.run_cycle(indicator_rows, ext)
+    log.info("cycle_result %s", json.dumps(result, default=str)[:2000])
+    print(json.dumps(result, default=str, indent=2))
+    return 0
 
 
-    # Creating System prompt
-    with open('system_prompt.txt', 'r') as f:
-        system_prompt = f.read()
-    system_prompt = system_prompt.format(portfolio_data, msg_info)
-        
-    print("L'agente sta decidendo la sua azione!")
-    out = previsione_trading_agent(system_prompt)
-    # print(out)
-    bot.execute_signal(out)
-
-
-    op_id = db_utils.log_bot_operation(out, system_prompt=system_prompt, indicators=indicators_json, news_text=news_txt, sentiment=sentiment_json, forecasts=forecasts_json)
-    print(f"[db_utils] Operazione inserita con id={op_id}")
-    account_status = bot.get_account_status()
-    # Scrivo su file come sta
-    with open('account_status_old.json', 'w') as f:
-        json.dump(account_status['open_positions'], f, indent=4)
-    snapshot_id = db_utils.log_account_status(account_status)
-    print(f"[db_utils] Operazione inserita con id={snapshot_id}")
-
-except Exception as e:
-    db_utils.log_error(e, context={"prompt": system_prompt, "tickers": tickers,
-                                    "indicators":indicators_json, "news":news_txt,
-                                    "sentiment":sentiment_json, "forecasts":forecasts_json,
-                                    "balance":account_status
-                                    }, source="trading_agent")
-    print(f"An error occurred: {e}")
+if __name__ == "__main__":
+    sys.exit(main())
